@@ -61,6 +61,10 @@ from .models import (
     sanitize_screen_ui_elements,
     parse_ocr_capture_profile_bucket_key,
 )
+from .ocr_chrome_noise import (
+    looks_like_temperature_status_line as _looks_like_temperature_status_line,
+    looks_like_window_title_line as _looks_like_window_title_line,
+)
 from .aihong_state import (
     AIHONG_CHOICES_REGION_PRESET as _AIHONG_CHOICES_REGION_PRESET,
     AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET as _AIHONG_DIALOGUE_CAPTURE_PROFILE_PRESET,
@@ -522,6 +526,22 @@ def _clean_ocr_dialogue_text(text: str) -> str:
     return cleaned
 
 
+def _drop_ocr_chrome_noise_lines(text: str, *, window_title: str = "") -> str:
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    meaningful = [line for line in lines if line]
+    if len(meaningful) < 2:
+        return str(text or "")
+    filtered = [
+        line
+        for line in meaningful
+        if not _looks_like_temperature_status_line(line)
+        and not _looks_like_window_title_line(line, window_title)
+    ]
+    if filtered and len(filtered) < len(meaningful):
+        return "\n".join(filtered)
+    return str(text or "")
+
+
 def _ocr_stability_key(text: str) -> str:
     normalized = normalize_text(str(text or "")).replace("\n", " ").strip().lower()
     if not normalized:
@@ -825,6 +845,21 @@ def _score_ocr_text(text: str) -> tuple[float, int, int]:
         - (isolated_ascii_tokens * 2.0)
     )
     return (score, cjk_count + kana_count, significant_chars)
+
+
+_PUNCTUATION_CONFUSION_FIXES = [
+    (re.compile(r"(?<=[^\x00-\x7F])\.(?![\x00-\x7F])"), "。"),
+    (re.compile(r"(?<=[^\x00-\x7F])\s*,\s*(?=[^\x00-\x7F])"), "、"),
+    (re.compile(r"(?<=[^\x00-\x7F])!(?![\x00-\x7F])"), "！"),
+    (re.compile(r"(?<=[^\x00-\x7F])\?(?![\x00-\x7F])"), "？"),
+]
+
+
+def _fix_ocr_punctuation_confusion(text: str) -> str:
+    value = str(text or "")
+    for pattern, replacement in _PUNCTUATION_CONFUSION_FIXES:
+        value = pattern.sub(replacement, value)
+    return value
 
 
 def _significant_char_count(text: str) -> int:
@@ -2284,6 +2319,127 @@ def _target_window_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]
     return rect
 
 
+def _valid_screen_rect(rect: tuple[int, int, int, int]) -> bool:
+    return int(rect[2] - rect[0]) > 0 and int(rect[3] - rect[1]) > 0
+
+
+def _intersect_screen_rect(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    left = max(int(first[0]), int(second[0]))
+    top = max(int(first[1]), int(second[1]))
+    right = min(int(first[2]), int(second[2]))
+    bottom = min(int(first[3]), int(second[3]))
+    rect = (left, top, right, bottom)
+    return rect if _valid_screen_rect(rect) else None
+
+
+def _bounding_screen_rect(
+    rects: Iterable[tuple[int, int, int, int]],
+) -> tuple[int, int, int, int] | None:
+    valid_rects = [rect for rect in rects if _valid_screen_rect(rect)]
+    if not valid_rects:
+        return None
+    return (
+        min(int(rect[0]) for rect in valid_rects),
+        min(int(rect[1]) for rect in valid_rects),
+        max(int(rect[2]) for rect in valid_rects),
+        max(int(rect[3]) for rect in valid_rects),
+    )
+
+
+def _target_monitor_work_rects(
+    rect: tuple[int, int, int, int],
+) -> list[tuple[int, int, int, int]]:
+    try:
+        import win32api
+
+        enum_display_monitors = getattr(win32api, "EnumDisplayMonitors", None)
+        if not callable(enum_display_monitors):
+            return []
+        try:
+            monitors = enum_display_monitors(None, tuple(int(value) for value in rect))
+        except TypeError:
+            monitors = enum_display_monitors()
+
+        work_rects: list[tuple[int, int, int, int]] = []
+        for monitor_info in monitors:
+            monitor = monitor_info[0]
+            try:
+                info = win32api.GetMonitorInfo(monitor)
+            except Exception:
+                continue
+            work = info.get("Work") if isinstance(info, dict) else None
+            if isinstance(work, tuple) and len(work) == 4:
+                work_rect = tuple(int(value) for value in work)
+                if _valid_screen_rect(work_rect):
+                    work_rects.append(work_rect)
+        return work_rects
+    except Exception:
+        return []
+
+
+def _target_monitor_work_rect(target: DetectedGameWindow) -> tuple[int, int, int, int] | None:
+    try:
+        import win32api
+
+        monitor = win32api.MonitorFromWindow(int(target.hwnd), 2)
+        info = win32api.GetMonitorInfo(monitor)
+        work = info.get("Work") if isinstance(info, dict) else None
+        if isinstance(work, tuple) and len(work) == 4:
+            rect = tuple(int(value) for value in work)
+            return rect if _valid_screen_rect(rect) else None
+    except Exception:
+        return None
+    return None
+
+
+def _target_work_area_capture_rect(
+    target: DetectedGameWindow,
+    rect: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    work_rects = _target_monitor_work_rects(rect)
+    if not work_rects:
+        work_rect = _target_monitor_work_rect(target)
+        work_rects = [work_rect] if work_rect is not None else []
+    intersections = (
+        intersection
+        for work_rect in work_rects
+        if (intersection := _intersect_screen_rect(rect, work_rect)) is not None
+    )
+    return _bounding_screen_rect(intersections)
+
+
+def _target_window_uses_overlapped_chrome(target: DetectedGameWindow) -> bool:
+    try:
+        import win32con
+        import win32gui
+
+        style = int(win32gui.GetWindowLong(int(target.hwnd), win32con.GWL_STYLE))
+        return bool(style & (win32con.WS_CAPTION | win32con.WS_THICKFRAME))
+    except Exception:
+        return False
+
+
+def _target_content_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]:
+    try:
+        rect = _target_client_rect(target)
+        if _valid_screen_rect(rect):
+            return rect
+    except Exception:
+        pass
+    return _target_window_rect(target)
+
+
+def _target_screen_capture_rect(target: DetectedGameWindow) -> tuple[int, int, int, int]:
+    rect = _target_content_rect(target)
+    if not _target_window_uses_overlapped_chrome(target):
+        return rect
+    clipped = _target_work_area_capture_rect(target, rect)
+    return clipped or rect
+
+
 def _target_window_capture_state(target: DetectedGameWindow | None) -> tuple[bool, bool, bool, str]:
     if target is None:
         return False, False, False, "target_missing"
@@ -2432,6 +2588,21 @@ def _crop_window_image(
     return cropped
 
 
+def _crop_image_to_screen_rect(
+    image: Any,
+    *,
+    image_rect: tuple[int, int, int, int],
+    crop_rect: tuple[int, int, int, int],
+) -> Any:
+    crop_left = max(0, int(crop_rect[0] - image_rect[0]))
+    crop_top = max(0, int(crop_rect[1] - image_rect[1]))
+    crop_right = min(int(image.size[0]), int(crop_rect[2] - image_rect[0]))
+    crop_bottom = min(int(image.size[1]), int(crop_rect[3] - image_rect[1]))
+    if crop_right <= crop_left or crop_bottom <= crop_top:
+        raise RuntimeError("Crop region outside source image")
+    return image.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+
 class MssCaptureBackend:
     kind = _CAPTURE_BACKEND_MSS
 
@@ -2463,7 +2634,7 @@ class MssCaptureBackend:
         from PIL import Image
 
         _require_visible_capture_target(target, backend_kind=self.kind)
-        rect = _target_window_rect(target)
+        rect = _target_screen_capture_rect(target)
         left, top, right, bottom = rect
         monitor = {
             "left": int(left),
@@ -2526,7 +2697,7 @@ class PyAutoGuiCaptureBackend:
         from PIL import ImageGrab
 
         _require_visible_capture_target(target, backend_kind=self.kind)
-        rect = _target_window_rect(target)
+        rect = _target_screen_capture_rect(target)
         left, top, right, bottom = rect
         # all_screens=True is Windows-only in Pillow but harmlessly ignored
         # on macOS/Linux — covers multi-monitor layouts including secondary
@@ -2566,7 +2737,10 @@ class PrintWindowCaptureBackend:
 
     def capture_frame(self, target: DetectedGameWindow, profile: OcrCaptureProfile) -> Any:
         _require_visible_capture_target(target, backend_kind=self.kind)
-        rect = _target_window_rect(target)
+        try:
+            rect = _target_screen_capture_rect(target)
+        except Exception:
+            rect = _target_content_rect(target)
         image = self._capture_full_window(target.hwnd, rect)
         return _crop_window_image(
             image,
@@ -2692,7 +2866,7 @@ class DxcamCaptureBackend:
         from PIL import Image
 
         _require_visible_capture_target(target, backend_kind=self.kind)
-        rect = _target_window_rect(target)
+        rect = _target_screen_capture_rect(target)
         frame = None
         with self._camera_lock:
             now = time.monotonic()
@@ -6159,6 +6333,22 @@ class OcrReaderManager:
         if backend_plan is not None and not backend_plan.primary.available:
             raise ValueError("当前 OCR backend 不可用，无法自动重校准对白区")
 
+        min_top_ratio = 0.04
+        try:
+            client_rect = _target_client_rect(target)
+            client_height = int(client_rect[3] - client_rect[1])
+            if client_height > 0 and image_height > client_height:
+                title_bar_height = image_height - client_height
+                min_top_ratio = max(
+                    min_top_ratio,
+                    round(title_bar_height / image_height + 0.02, 2),
+                )
+        except Exception:
+            pass
+        top_values = [value for value in top_values if value >= min_top_ratio]
+        if not top_values:
+            top_values = [min_top_ratio]
+
         best_candidate: dict[str, Any] | None = None
         current_distance_basis = (
             round(base_profile.top_ratio, 2),
@@ -6419,6 +6609,23 @@ class OcrReaderManager:
         state.last_block_reason = ""
         return True
 
+    def _ocr_window_title_for_noise_filter(self) -> str:
+        return str(
+            (self._attached_window.title if self._attached_window is not None else "")
+            or self._runtime.effective_window_title
+            or self._runtime.window_title
+            or ""
+        )
+
+    def _clean_ocr_dialogue_for_emit(self, raw_text: str) -> tuple[str, str]:
+        content_text = _drop_ocr_chrome_noise_lines(
+            raw_text,
+            window_title=self._ocr_window_title_for_noise_filter(),
+        )
+        cleaned_text = _clean_ocr_dialogue_text(content_text)
+        cleaned_text = _fix_ocr_punctuation_confusion(cleaned_text)
+        return content_text, cleaned_text
+
     def _emit_line_from_ocr_text(
         self,
         raw_text: str,
@@ -6430,14 +6637,14 @@ class OcrReaderManager:
         ocr_confidence: float | None = None,
         text_source: str = "bottom_region",
     ) -> bool:
-        cleaned_text = _clean_ocr_dialogue_text(raw_text)
+        content_text, cleaned_text = self._clean_ocr_dialogue_for_emit(raw_text)
         if (
             _looks_like_noise_normalized_text(cleaned_text)
             or _looks_like_game_overlay_normalized_text(cleaned_text)
             or not _looks_like_ocr_dialogue_normalized_text(cleaned_text)
         ):
             return False
-        self._record_accepted_ocr_text(raw_text)
+        self._record_accepted_ocr_text(content_text)
         speaker, text = OcrReaderBridgeWriter._split_speaker_text(cleaned_text)
         had_pending_visual_scene = bool(self._pending_visual_scene_hash)
         if self._pending_visual_scene_hash:
@@ -6526,13 +6733,14 @@ class OcrReaderManager:
             choice_bounds_metadata=choice_bounds_metadata,
         )
 
-    @staticmethod
     def _should_attempt_followup_confirm(
+        self,
         raw_text: str,
         *,
         state: _StableOcrTextState,
     ) -> bool:
-        cleaned = normalize_text(_clean_ocr_dialogue_text(raw_text)).strip()
+        _, cleaned_text = self._clean_ocr_dialogue_for_emit(raw_text)
+        cleaned = normalize_text(cleaned_text).strip()
         if not cleaned:
             return False
         cleaned_key = _ocr_stability_key(cleaned)
@@ -8475,16 +8683,20 @@ class OcrReaderManager:
                 if callable(extract_with_boxes):
                     try:
                         text, boxes = extract_with_boxes(image)
-                        if not str(text or "").strip() and not isinstance(
-                            descriptor.backend,
-                            RapidOcrBackend,
-                        ):
-                            extract_text = getattr(descriptor.backend, "extract_text", None)
-                            if callable(extract_text):
-                                fallback_text = extract_text(image)
-                                if str(fallback_text or "").strip():
-                                    text = fallback_text
-                                    boxes = []
+                        if not str(text or "").strip():
+                            if not isinstance(descriptor.backend, RapidOcrBackend):
+                                extract_text = getattr(descriptor.backend, "extract_text", None)
+                                if callable(extract_text):
+                                    fallback_text = extract_text(image)
+                                    if str(fallback_text or "").strip():
+                                        text = fallback_text
+                                        boxes = []
+                            elif index == 0:
+                                warnings.append(
+                                    f"ocr_reader {descriptor.kind} returned empty text "
+                                    "(confidence filtering may have discarded all tokens)"
+                                )
+                                continue
                     except Exception as boxes_exc:
                         extract_text = getattr(descriptor.backend, "extract_text", None)
                         if not callable(extract_text):

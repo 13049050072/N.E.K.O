@@ -1824,7 +1824,7 @@ function buildFirstRunSteps(status = {}) {
         'ui.first_run.install_ocr.pending_models',
         '所选语言模型 ({lang} + {version}) 未下载。点击「立即下载模型」按钮，从 ModelScope 拉取约 {size} MB 的模型文件。',
         {
-          lang: rapidocr.lang_type || 'japan',
+          lang: rapidocr.lang_type || 'ch',
           version: rapidocr.ocr_version || 'PP-OCRv4',
           size: sizeMb,
         },
@@ -1837,7 +1837,7 @@ function buildFirstRunSteps(status = {}) {
         'ui.first_run.install_ocr.pending_models_manual',
         '所选语言模型 ({lang} + {version}) 未下载。当前环境不能自动下载，请按下方 RapidOCR 横幅说明手动放置模型后再刷新状态。',
         {
-          lang: rapidocr.lang_type || 'japan',
+          lang: rapidocr.lang_type || 'ch',
           version: rapidocr.ocr_version || 'PP-OCRv4',
         },
       );
@@ -2517,10 +2517,23 @@ function dependencySummaryItem(kind, status = {}) {
       && taskState?.state === 'installed'
       && hasMissingRapidOcrModelFiles(rapidocr);
     if (taskState && rapidocrModelsStillMissing && !taskCompletedButModelsMissing) {
+      const displayTaskState = kind === 'rapidocr' && taskState.state === 'running'
+        ? {
+            ...taskState,
+            labelText: uiT('ui.install.rapidocr.download_models.running', '后台下载模型中...'),
+            needsAttention: false,
+          }
+        : kind === 'rapidocr' && taskState.state === 'failed' && shouldOfferRapidOcrModelsDownload(rapidocr)
+          ? {
+              ...taskState,
+              labelText: uiT('ui.install.rapidocr.download_models.retry', '重试下载模型'),
+              needsAttention: true,
+            }
+          : taskState;
       return {
         kind,
         label: kind === 'rapidocr' ? 'RapidOCR' : getInstallConfig(taskKind).label,
-        ...taskState,
+        ...displayTaskState,
       };
     }
   }
@@ -5728,7 +5741,7 @@ function renderAgentStatus(payload) {
   const panelSummary = document.getElementById('agentPanelSummary');
   if (panelSummary) {
     const mode = latestStatus?.mode || 'companion';
-    const modeText = uiT(`ui.mode.${mode}`, mode);
+    const modeText = modeLabel(mode, mode);
     const inbound = payload.inbound_queue_size || 0;
     const outbound = payload.outbound_queue_size || 0;
     panelSummary.textContent = `${modeText} | in=${inbound} out=${outbound}`;

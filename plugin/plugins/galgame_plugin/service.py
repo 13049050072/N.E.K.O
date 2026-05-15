@@ -61,16 +61,21 @@ from .dependency_status import (
 from .dxcam_support import inspect_dxcam_installation
 from .reader import expand_bridge_root, normalize_text, read_session_json
 from .rapidocr_support import (
+    _BAIDU_YUN_RAPIDOCR_CODE,
+    _BAIDU_YUN_RAPIDOCR_URL,
     DEFAULT_RAPIDOCR_ENGINE_TYPE,
     DEFAULT_RAPIDOCR_LANG_TYPE,
     DEFAULT_RAPIDOCR_MODEL_TYPE,
     DEFAULT_RAPIDOCR_OCR_VERSION,
     inspect_rapidocr_installation,
+    resolve_rapidocr_model_cache_dir,
 )
-from .tesseract_support import inspect_tesseract_installation
 from .textractor_support import (
+    _BAIDU_YUN_TEXTTRACTOR_CODE,
+    _BAIDU_YUN_TEXTTRACTOR_URL,
     DEFAULT_TEXTRACTOR_RELEASE_API_URL,
     inspect_textractor_installation,
+    resolve_textractor_install_target,
 )
 
 _logger = logging.getLogger(__name__)
@@ -106,6 +111,54 @@ def _cached_install_inspection(
 def clear_install_inspection_cache() -> None:
     with _INSTALL_INSPECT_CACHE_LOCK:
         _INSTALL_INSPECT_CACHE.clear()
+
+
+def _build_download_guide_payload(
+    *,
+    config: GalgameConfig,
+    textractor: dict[str, Any],
+    rapidocr: dict[str, Any],
+) -> dict[str, Any]:
+    textractor_target = str(
+        textractor.get("target_dir")
+        or resolve_textractor_install_target(config.memory_reader_install_target_dir)
+        or ""
+    )
+    rapidocr_target = str(
+        rapidocr.get("model_cache_dir")
+        or resolve_rapidocr_model_cache_dir(config.rapidocr_install_target_dir)
+        or ""
+    )
+    textractor_available = (
+        bool(_BAIDU_YUN_TEXTTRACTOR_URL)
+        and "____" not in _BAIDU_YUN_TEXTTRACTOR_URL
+        and bool(_BAIDU_YUN_TEXTTRACTOR_CODE)
+        and _BAIDU_YUN_TEXTTRACTOR_CODE != "____"
+        and not bool(textractor.get("installed"))
+    )
+    rapidocr_available = (
+        bool(_BAIDU_YUN_RAPIDOCR_URL)
+        and "____" not in _BAIDU_YUN_RAPIDOCR_URL
+        and bool(_BAIDU_YUN_RAPIDOCR_CODE)
+        and _BAIDU_YUN_RAPIDOCR_CODE != "____"
+        and not bool(rapidocr.get("installed"))
+    )
+    return {
+        "textractor": {
+            "available": textractor_available,
+            "url": _BAIDU_YUN_TEXTTRACTOR_URL,
+            "code": _BAIDU_YUN_TEXTTRACTOR_CODE,
+            "target_dir": textractor_target,
+            "note": "Download TextractorCLI.exe manually and place it in the target directory.",
+        },
+        "rapidocr_models": {
+            "available": rapidocr_available,
+            "url": _BAIDU_YUN_RAPIDOCR_URL,
+            "code": _BAIDU_YUN_RAPIDOCR_CODE,
+            "target_dir": rapidocr_target,
+            "note": "Download the RapidOCR model files manually and place them in the model cache directory.",
+        },
+    }
 
 
 def _current_process_performance() -> dict[str, Any]:
@@ -343,7 +396,7 @@ def _coerce_bool(value: object, default: bool) -> bool:
 
 def _coerce_ocr_backend_selection(value: object, default: str = "auto") -> str:
     normalized = str(value or default).strip().lower()
-    if normalized in {"auto", "rapidocr", "tesseract"}:
+    if normalized in {"auto", "rapidocr"}:
         return normalized
     return default
 
@@ -719,7 +772,6 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             "smart",
         ),
         ocr_reader_capture_backend_explicit="capture_backend" in ocr_reader_obj,
-        ocr_reader_tesseract_path=str(ocr_reader_obj.get("tesseract_path") or ""),
         ocr_reader_install_manifest_url=str(
             ocr_reader_obj.get("install_manifest_url") or ""
         ).strip(),
@@ -1160,13 +1212,21 @@ def _primary_diagnosis(
     title: str,
     message: str,
     actions: list[dict[str, str]],
+    *,
+    title_i18n_key: str = "",
+    message_i18n_key: str = "",
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "severity": severity,
         "title": title,
         "message": message,
         "actions": actions,
     }
+    if title_i18n_key:
+        payload["title_i18n_key"] = title_i18n_key
+    if message_i18n_key:
+        payload["message_i18n_key"] = message_i18n_key
+    return payload
 
 
 def _status_text(value: Any) -> str:
@@ -1189,6 +1249,15 @@ def _is_textractor_missing_error_message(message: str) -> bool:
             "textractor" in normalized
             and ("missing" in normalized or "invalid" in normalized)
         )
+    )
+
+
+def _is_self_ui_guard_message(message: str) -> bool:
+    normalized = _status_text(message).lower()
+    return (
+        "ocr_reader ignored text that looks like the n.e.k.o plugin ui"
+        in normalized
+        or "self_ui_guard" in normalized
     )
 
 
@@ -1423,6 +1492,7 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
         item for item in inspection_failed_dependencies if item in {"rapidocr", "dxcam"}
     ]
     textractor_last_error_signal = _is_textractor_missing_error_message(last_error_message)
+    self_ui_guard_signal = _is_self_ui_guard_message(last_error_message)
     textractor_missing_signal = (
         memory_runtime_detail == "invalid_textractor_path"
         or _status_text(textractor_obj.get("detail")) == "missing"
@@ -1442,7 +1512,10 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
     )
     generic_last_error_message = (
         ""
-        if textractor_last_error_signal and not memory_reader_path_active
+        if (
+            self_ui_guard_signal
+            or (textractor_last_error_signal and not memory_reader_path_active)
+        )
         else last_error_message
     )
 
@@ -1488,6 +1561,25 @@ def build_primary_diagnosis(local_state: dict[str, Any]) -> dict[str, Any]:
                 _diagnosis_action("install_textractor", "安装 Textractor"),
                 _diagnosis_action("refresh_all", "刷新全部"),
             ],
+        )
+
+    if self_ui_guard_signal:
+        return _primary_diagnosis(
+            "warning",
+            "OCR 截到了插件 UI，已忽略",
+            (
+                "OCR Reader 识别到的文字像 N.E.K.O 插件管理页，而不是游戏画面。"
+                "这次结果已被丢弃，避免把插件界面文字写成台词。"
+                "请切回游戏窗口，或重新选择 OCR 目标窗口。"
+            ),
+            [
+                _diagnosis_action("focus_game", "切回游戏窗口"),
+                _diagnosis_action("select_ocr_window", "选择游戏窗口"),
+                _diagnosis_action("refresh_ocr_windows", "刷新窗口"),
+                _diagnosis_action("debug_details", "查看调试详情"),
+            ],
+            title_i18n_key="ui.diag.self_ui_guard.title",
+            message_i18n_key="ui.diag.self_ui_guard.body",
         )
 
     if generic_last_error_message:
@@ -2273,19 +2365,6 @@ def _build_status_payload_unchecked(
     rapidocr["auto_detect_last_lang"] = str(
         getattr(config, "rapidocr_auto_detect_last_lang", "") or ""
     )
-    tesseract = _cached_install_inspection(
-        (
-            "tesseract",
-            config.ocr_reader_tesseract_path,
-            config.ocr_reader_install_target_dir,
-            config.ocr_reader_languages,
-        ),
-        lambda: inspect_tesseract_installation(
-            configured_path=config.ocr_reader_tesseract_path,
-            install_target_dir_raw=config.ocr_reader_install_target_dir,
-            languages=config.ocr_reader_languages,
-        ),
-    )
     ocr_runtime = copy_for_payload(state.ocr_reader_runtime)
     ocr_runtime_obj = ocr_runtime if isinstance(ocr_runtime, dict) else {}
     last_error = copy_for_payload(state.last_error)
@@ -2312,6 +2391,13 @@ def _build_status_payload_unchecked(
         if str(ocr_runtime_obj.get("stable_ocr_block_reason") or "") == "waiting_for_repeat"
         else 0.0
     )
+    last_stable_history_line = _latest_stable_history_line(state.history_lines)
+    if (
+        last_stable_history_line
+        and isinstance(ocr_runtime_obj, dict)
+        and not _line_text_from_status(ocr_runtime_obj.get("last_stable_line"))
+    ):
+        ocr_runtime_obj["last_stable_line"] = copy_for_payload(last_stable_history_line)
     local_state = {
         "latest_snapshot": copy_for_payload(state.latest_snapshot),
         "history_observed_lines": copy_for_payload(state.history_observed_lines),
@@ -2526,7 +2612,11 @@ def _build_status_payload_unchecked(
         "dxcam": dxcam,
         "rapidocr": rapidocr,
         "textractor": textractor,
-        "tesseract": tesseract,
+        "download_guide": _build_download_guide_payload(
+            config=config,
+            textractor=textractor,
+            rapidocr=rapidocr,
+        ),
         # Recompute dependency_status off the just-inspected payload so the
         # UI doesn't show "缺依赖" warnings for components that just finished
         # installing (state.dependency_status is updated lazily, this is the
@@ -2723,6 +2813,25 @@ def resolve_effective_current_line(local_state: dict[str, Any]) -> dict[str, Any
             )
             return result
     return None
+
+
+def _latest_stable_history_line(history_lines: Any) -> dict[str, Any]:
+    if not isinstance(history_lines, list):
+        return {}
+    for item in reversed(history_lines):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("stability") or "").strip().lower() != "stable":
+            continue
+        text = str(item.get("text") or "")
+        line_id = str(item.get("line_id") or "")
+        if not text or not line_id:
+            continue
+        result = dict(item)
+        result["source"] = str(result.get("source") or "stable")
+        result["stability"] = "stable"
+        return result
+    return {}
 
 
 def build_ocr_context_diagnostic(local_state: dict[str, Any]) -> str:

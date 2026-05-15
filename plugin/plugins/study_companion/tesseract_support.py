@@ -4,17 +4,17 @@ import asyncio
 import hashlib
 import inspect
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-
-from .install_tasks import update_install_task_state
-from .memory_reader import is_windows_platform
 
 TESSERACT_EXECUTABLE = "tesseract.exe"
 DEFAULT_TESSERACT_LANGUAGES = "chi_sim+jpn+eng"
@@ -36,6 +36,13 @@ DEFAULT_TESSDATA_SHA256 = {
     "eng": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
 }
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+_CJK_OR_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_TESSERACT_CMD_LOCK = threading.Lock()
+
+
+def _is_windows_platform() -> bool:
+    return os.name == "nt"
 
 
 def _required_languages(languages: str) -> list[str]:
@@ -100,32 +107,18 @@ def _iter_tesseract_candidates(
             TESSERACT_EXECUTABLE,
         )
     )
-    _add(
-        _candidate_path_from_env(
-            "LOCALAPPDATA",
-            "Programs",
-            "Tesseract-OCR",
-            TESSERACT_EXECUTABLE,
-        )
-    )
-    _add(
-        _candidate_path_from_env(
-            "ProgramFiles",
-            "Tesseract-OCR",
-            TESSERACT_EXECUTABLE,
-        )
-    )
-    _add(
-        _candidate_path_from_env(
-            "ProgramFiles(x86)",
-            "Tesseract-OCR",
-            TESSERACT_EXECUTABLE,
-        )
-    )
+    _add(_candidate_path_from_env("LOCALAPPDATA", "Programs", "Tesseract-OCR", TESSERACT_EXECUTABLE))
+    _add(_candidate_path_from_env("ProgramFiles", "Tesseract-OCR", TESSERACT_EXECUTABLE))
+    _add(_candidate_path_from_env("ProgramFiles(x86)", "Tesseract-OCR", TESSERACT_EXECUTABLE))
     return candidates
 
 
-def resolve_tesseract_path(configured_path: str, *, install_target_dir_raw: str = "", prioritize_install_target: bool = False) -> str:
+def resolve_tesseract_path(
+    configured_path: str,
+    *,
+    install_target_dir_raw: str = "",
+    prioritize_install_target: bool = False,
+) -> str:
     for candidate in _iter_tesseract_candidates(
         configured_path,
         install_target_dir_raw=install_target_dir_raw,
@@ -137,7 +130,7 @@ def resolve_tesseract_path(configured_path: str, *, install_target_dir_raw: str 
 
 
 def default_tesseract_install_target_raw() -> str:
-    if is_windows_platform():
+    if _is_windows_platform():
         return "%LOCALAPPDATA%/Programs/N.E.K.O/Tesseract-OCR"
     return ""
 
@@ -163,7 +156,7 @@ def inspect_tesseract_installation(
     platform_fn: Callable[[], bool] | None = None,
     prioritize_install_target: bool = False,
 ) -> dict[str, Any]:
-    checker = platform_fn or is_windows_platform
+    checker = platform_fn or _is_windows_platform
     supported = bool(checker())
     target_dir = resolve_tesseract_install_target(install_target_dir_raw)
     expected_executable_path = str(target_dir / TESSERACT_EXECUTABLE) if target_dir.parts else ""
@@ -204,9 +197,8 @@ def inspect_tesseract_installation(
 
 
 def _default_install_manifest(languages: str) -> dict[str, Any]:
-    required_languages = _required_languages(languages)
     language_assets: list[dict[str, str]] = []
-    for language in required_languages:
+    for language in _required_languages(languages):
         asset = {
             "name": f"{language}.traineddata",
             "url": f"{DEFAULT_TESSDATA_BASE_URL}/{language}.traineddata",
@@ -221,12 +213,7 @@ def _default_install_manifest(languages: str) -> dict[str, Any]:
             "name": "tesseract-ocr-w64-setup-5.4.0.20240606.exe",
             "url": DEFAULT_TESSERACT_INSTALLER_URL,
             "sha256": DEFAULT_TESSERACT_INSTALLER_SHA256,
-            "silent_args": [
-                "/VERYSILENT",
-                "/SUPPRESSMSGBOXES",
-                "/NORESTART",
-                "/SP-",
-            ],
+            "silent_args": ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"],
         },
         "languages": language_assets,
     }
@@ -241,6 +228,23 @@ async def _emit_progress(
     maybe_awaitable = progress_callback(dict(payload))
     if inspect.isawaitable(maybe_awaitable):
         await maybe_awaitable
+
+
+def _with_task_context(payload: dict[str, Any], *, task_id: str | None, plugin_id: str) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized["task_id"] = str(task_id or "")
+    normalized["plugin_id"] = plugin_id
+    return normalized
+
+
+async def _emit_install_progress(
+    progress_callback: ProgressCallback | None,
+    payload: dict[str, Any],
+    *,
+    task_id: str | None,
+    plugin_id: str,
+) -> None:
+    await _emit_progress(progress_callback, _with_task_context(payload, task_id=task_id, plugin_id=plugin_id))
 
 
 def _compute_phase_progress(
@@ -326,7 +330,7 @@ async def _download_file(
     destination: Path,
     timeout_seconds: float,
     task_id: str | None = None,
-    plugin_id: str = "galgame_plugin",
+    plugin_id: str = "study_companion",
     progress_callback: ProgressCallback | None = None,
     phase: str = "downloading",
     message: str = "",
@@ -340,17 +344,12 @@ async def _download_file(
         existing_size = destination.stat().st_size if destination.exists() else 0
         request_headers = {
             "Accept": "application/octet-stream",
-            "User-Agent": "N.E.K.O/galgame_plugin",
+            "User-Agent": "N.E.K.O/study_companion",
         }
         if allow_resume and existing_size > 0:
             request_headers["Range"] = f"bytes={existing_size}-"
 
-        async with client.stream(
-            "GET",
-            url,
-            headers=request_headers,
-            timeout=timeout_seconds,
-        ) as response:
+        async with client.stream("GET", url, headers=request_headers, timeout=timeout_seconds) as response:
             if response.status_code == 416 and allow_resume and existing_size > 0:
                 destination.unlink(missing_ok=True)
                 return await _run_download(allow_resume=False)
@@ -380,9 +379,12 @@ async def _download_file(
                 "asset_name": asset_name,
                 "error": "",
             }
-            if task_id:
-                update_install_task_state(task_id, kind="tesseract", plugin_id=plugin_id, **initial_progress)
-            await _emit_progress(progress_callback, initial_progress)
+            await _emit_install_progress(
+                progress_callback,
+                initial_progress,
+                task_id=task_id,
+                plugin_id=plugin_id,
+            )
             last_progress_emit_at = time.monotonic()
 
             with destination.open(open_mode) as handle:
@@ -418,9 +420,12 @@ async def _download_file(
                         "asset_name": asset_name,
                         "error": "",
                     }
-                    if task_id:
-                        update_install_task_state(task_id, kind="tesseract", plugin_id=plugin_id, **chunk_progress)
-                    await _emit_progress(progress_callback, chunk_progress)
+                    await _emit_install_progress(
+                        progress_callback,
+                        chunk_progress,
+                        task_id=task_id,
+                        plugin_id=plugin_id,
+                    )
 
             result = {
                 "downloaded_bytes": downloaded_bytes,
@@ -449,7 +454,7 @@ async def _load_install_manifest(
         str(manifest_url).strip(),
         headers={
             "Accept": "application/json",
-            "User-Agent": "N.E.K.O/galgame_plugin",
+            "User-Agent": "N.E.K.O/study_companion",
         },
         timeout=timeout_seconds,
     )
@@ -482,7 +487,7 @@ async def install_tesseract(
     platform_fn: Callable[[], bool] | None = None,
     client_factory: Callable[[], Awaitable[httpx.AsyncClient] | httpx.AsyncClient] | None = None,
     task_id: str | None = None,
-    plugin_id: str = "galgame_plugin",
+    plugin_id: str = "study_companion",
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     install_status = inspect_tesseract_installation(
@@ -501,19 +506,7 @@ async def install_tesseract(
             "release_name": "",
             "asset_name": "",
         }
-        if task_id:
-            update_install_task_state(
-                task_id,
-                kind="tesseract",
-                plugin_id=plugin_id,
-                status="completed",
-                phase="completed",
-                message="Tesseract is already installed",
-                progress=1.0,
-                target_dir=str(install_status.get("target_dir") or ""),
-                detected_path=str(install_status.get("detected_path") or ""),
-            )
-        await _emit_progress(
+        await _emit_install_progress(
             progress_callback,
             {
                 "status": "completed",
@@ -528,6 +521,8 @@ async def install_tesseract(
                 "release_name": "",
                 "asset_name": "",
             },
+            task_id=task_id,
+            plugin_id=plugin_id,
         )
         return result
 
@@ -535,18 +530,7 @@ async def install_tesseract(
     if not target_dir:
         raise RuntimeError("missing Tesseract install target directory")
 
-    if task_id:
-        update_install_task_state(
-            task_id,
-            kind="tesseract",
-            plugin_id=plugin_id,
-            status="running",
-            phase="metadata",
-            message="Fetching Tesseract install metadata",
-            progress=_compute_phase_progress("metadata"),
-            target_dir=str(target_dir),
-        )
-    await _emit_progress(
+    await _emit_install_progress(
         progress_callback,
         {
             "status": "running",
@@ -561,16 +545,14 @@ async def install_tesseract(
             "release_name": "",
             "asset_name": "",
         },
+        task_id=task_id,
+        plugin_id=plugin_id,
     )
 
     owned_client = False
     client: httpx.AsyncClient | None = None
     if client_factory is None:
-        client = httpx.AsyncClient(
-            timeout=timeout_seconds,
-            trust_env=True,
-            follow_redirects=True,
-        )
+        client = httpx.AsyncClient(timeout=timeout_seconds, trust_env=True, follow_redirects=True)
         owned_client = True
     else:
         maybe_client = client_factory()
@@ -587,20 +569,18 @@ async def install_tesseract(
         installer = manifest.get("installer")
         installer_obj = installer if isinstance(installer, dict) else {}
         installer_url = str(installer_obj.get("url") or "").strip()
-        installer_name = str(installer_obj.get("name") or Path(installer_url).name or "tesseract-installer.exe").strip()
+        installer_name = str(
+            installer_obj.get("name") or Path(installer_url).name or "tesseract-installer.exe"
+        ).strip()
         if not installer_url:
             raise RuntimeError("tesseract install manifest is missing installer.url")
-        silent_args = [
-            str(item).strip()
-            for item in installer_obj.get("silent_args", [])
-            if str(item).strip()
-        ]
+        silent_args = [str(item).strip() for item in installer_obj.get("silent_args", []) if str(item).strip()]
         if not silent_args:
             silent_args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]
         languages_obj = manifest.get("languages")
         language_assets = languages_obj if isinstance(languages_obj, list) else []
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="neko-tesseract-"))
+        tmp_dir = Path(tempfile.mkdtemp(prefix="neko-study-tesseract-"))
         try:
             installer_path = tmp_dir / installer_name
             installer_download = await _download_file(
@@ -633,9 +613,12 @@ async def install_tesseract(
                 "asset_name": installer_name,
                 "error": "",
             }
-            if task_id:
-                update_install_task_state(task_id, kind="tesseract", plugin_id=plugin_id, **installing_progress)
-            await _emit_progress(progress_callback, installing_progress)
+            await _emit_install_progress(
+                progress_callback,
+                installing_progress,
+                task_id=task_id,
+                plugin_id=plugin_id,
+            )
             await asyncio.to_thread(
                 _run_tesseract_installer,
                 installer_path,
@@ -683,9 +666,12 @@ async def install_tesseract(
                 "asset_name": installer_name,
                 "error": "",
             }
-            if task_id:
-                update_install_task_state(task_id, kind="tesseract", plugin_id=plugin_id, **verifying_progress)
-            await _emit_progress(progress_callback, verifying_progress)
+            await _emit_install_progress(
+                progress_callback,
+                verifying_progress,
+                task_id=task_id,
+                plugin_id=plugin_id,
+            )
 
             result_status = inspect_tesseract_installation(
                 configured_path=configured_path,
@@ -720,9 +706,12 @@ async def install_tesseract(
                 "asset_name": installer_name,
                 "error": "",
             }
-            if task_id:
-                update_install_task_state(task_id, kind="tesseract", plugin_id=plugin_id, **completed_progress)
-            await _emit_progress(progress_callback, completed_progress)
+            await _emit_install_progress(
+                progress_callback,
+                completed_progress,
+                task_id=task_id,
+                plugin_id=plugin_id,
+            )
             return result
         finally:
             try:
@@ -732,19 +721,7 @@ async def install_tesseract(
                     logger.warning("Tesseract temp cleanup failed: {}", exc)
     except Exception as exc:
         error_message = str(exc)
-        if task_id:
-            update_install_task_state(
-                task_id,
-                kind="tesseract",
-                plugin_id=plugin_id,
-                status="failed",
-                phase="failed",
-                message=error_message,
-                progress=_compute_phase_progress("failed"),
-                target_dir=str(target_dir),
-                error=error_message,
-            )
-        await _emit_progress(
+        await _emit_install_progress(
             progress_callback,
             {
                 "status": "failed",
@@ -760,8 +737,100 @@ async def install_tesseract(
                 "asset_name": "",
                 "error": error_message,
             },
+            task_id=task_id,
+            plugin_id=plugin_id,
         )
         raise
     finally:
         if owned_client and client is not None:
             await client.aclose()
+
+
+def _prepare_ocr_image(image: Any) -> Any:
+    from PIL import Image, ImageOps
+
+    if hasattr(Image, "Resampling"):
+        resample_filter = Image.Resampling.LANCZOS
+    else:
+        resample_filter = getattr(Image, "LANCZOS", Image.BICUBIC)
+    prepared = image.convert("L")
+    prepared = ImageOps.autocontrast(prepared)
+    long_edge = max(prepared.width, prepared.height, 1)
+    if long_edge < 1200:
+        scale = min(3.0, 1200 / long_edge)
+        prepared = prepared.resize(
+            (max(1, int(prepared.width * scale)), max(1, int(prepared.height * scale))),
+            resample_filter,
+        )
+    return prepared
+
+
+def _score_ocr_text(text: str) -> tuple[float, int, int]:
+    normalized = str(text or "").strip()
+    cjk_or_kana_count = len(_CJK_OR_KANA_RE.findall(normalized))
+    significant_chars = sum(1 for char in normalized if char.isalnum() or _CJK_OR_KANA_RE.match(char))
+    score = float(significant_chars + (cjk_or_kana_count * 2))
+    return score, cjk_or_kana_count, significant_chars
+
+
+@contextmanager
+def _temporary_tesseract_cmd(pytesseract: Any, path: str):
+    with _TESSERACT_CMD_LOCK:
+        original_cmd = pytesseract.pytesseract.tesseract_cmd
+        try:
+            if path:
+                pytesseract.pytesseract.tesseract_cmd = path
+            yield
+        finally:
+            pytesseract.pytesseract.tesseract_cmd = original_cmd
+
+
+class TesseractOcrBackend:
+    def __init__(
+        self,
+        *,
+        tesseract_path: str = "",
+        install_target_dir_raw: str = "",
+        languages: str = "",
+    ) -> None:
+        self._tesseract_path = tesseract_path
+        self._install_target_dir_raw = install_target_dir_raw
+        self._languages = languages
+
+    def is_available(self) -> bool:
+        path = resolve_tesseract_path(
+            self._tesseract_path,
+            install_target_dir_raw=self._install_target_dir_raw,
+        )
+        if not path:
+            return False
+        inspection = inspect_tesseract_installation(
+            configured_path=self._tesseract_path,
+            install_target_dir_raw=self._install_target_dir_raw,
+            languages=self._languages,
+        )
+        return bool(inspection.get("installed"))
+
+    def extract_text(self, image: Any) -> str:
+        import pytesseract
+
+        path = resolve_tesseract_path(
+            self._tesseract_path,
+            install_target_dir_raw=self._install_target_dir_raw,
+        )
+        config = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+        prepared = _prepare_ocr_image(image)
+
+        best_text = ""
+        best_score = (-1.0, 0, 0)
+        with _temporary_tesseract_cmd(pytesseract, path):
+            for candidate in (image, prepared):
+                text = pytesseract.image_to_string(candidate, lang=self._languages, config=config).strip()
+                score = _score_ocr_text(text)
+                if score > best_score:
+                    best_text = text
+                    best_score = score
+                score_value, cjk_or_kana_count, significant_chars = score
+                if significant_chars >= 8 and ((cjk_or_kana_count >= 2 and score_value >= 14.0) or score_value >= 20.0):
+                    break
+        return best_text

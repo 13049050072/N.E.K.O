@@ -78,7 +78,6 @@ def _patch_status_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(galgame_service, "inspect_dxcam_installation", lambda: {})
     monkeypatch.setattr(galgame_service, "inspect_textractor_installation", lambda **kwargs: {})
     monkeypatch.setattr(galgame_service, "inspect_rapidocr_installation", lambda **kwargs: {})
-    monkeypatch.setattr(galgame_service, "inspect_tesseract_installation", lambda **kwargs: {})
     monkeypatch.setattr(galgame_service, "_current_process_performance", lambda: {})
 
 
@@ -703,6 +702,104 @@ def test_status_payload_snapshot_fast_path_skips_json_copy(monkeypatch: pytest.M
     assert payload["primary_diagnosis"]["title"]
 
 
+def test_status_payload_keeps_last_stable_line_after_new_ocr_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = galgame_service.build_config({})
+    state = _status_state(
+        ocr_reader_runtime={
+            "status": "running",
+            "last_observed_line": {
+                "text": "我患了一种病。",
+                "line_id": "ocr:observed",
+                "stability": "tentative",
+            },
+        },
+        latest_snapshot={
+            "speaker": "",
+            "text": "我患了一种病。",
+            "line_id": "ocr:observed",
+            "scene_id": "ocr:game:scene-0001",
+            "route_id": "ocr",
+            "choices": [],
+            "is_menu_open": False,
+            "stability": "tentative",
+        },
+        history_lines=[
+            {
+                "speaker": "",
+                "text": "上一条已确认台词。",
+                "line_id": "ocr:stable",
+                "scene_id": "ocr:game:scene-0001",
+                "route_id": "ocr",
+                "stability": "stable",
+                "ts": "2026-05-13T17:39:52Z",
+            }
+        ],
+    )
+    _patch_status_dependencies(monkeypatch)
+
+    payload = galgame_service.build_status_payload(
+        state,
+        config=config,
+        state_is_snapshot=True,
+    )
+
+    assert payload["effective_current_line"]["stability"] == "tentative"
+    assert payload["ocr_reader_runtime"]["last_stable_line"]["text"] == "上一条已确认台词。"
+    assert payload["ocr_reader_runtime"]["last_stable_line"]["source"] == "stable"
+
+
+def test_status_payload_skips_tentative_history_when_backfilling_last_stable_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = galgame_service.build_config({})
+    state = _status_state(
+        ocr_reader_runtime={"status": "running"},
+        latest_snapshot={
+            "speaker": "",
+            "text": "新的候选台词。",
+            "line_id": "ocr:tentative",
+            "scene_id": "ocr:game:scene-0001",
+            "route_id": "ocr",
+            "choices": [],
+            "is_menu_open": False,
+            "stability": "tentative",
+        },
+        history_lines=[
+            {
+                "speaker": "",
+                "text": "上一条已确认台词。",
+                "line_id": "ocr:stable",
+                "scene_id": "ocr:game:scene-0001",
+                "route_id": "ocr",
+                "stability": "stable",
+                "ts": "2026-05-13T17:39:52Z",
+            },
+            {
+                "speaker": "",
+                "text": "新的候选台词。",
+                "line_id": "ocr:tentative",
+                "scene_id": "ocr:game:scene-0001",
+                "route_id": "ocr",
+                "stability": "tentative",
+                "ts": "2026-05-13T17:40:01Z",
+            },
+        ],
+    )
+    _patch_status_dependencies(monkeypatch)
+
+    payload = galgame_service.build_status_payload(
+        state,
+        config=config,
+        state_is_snapshot=True,
+    )
+
+    assert payload["ocr_reader_runtime"]["last_stable_line"]["text"] == "上一条已确认台词。"
+    assert payload["ocr_reader_runtime"]["last_stable_line"]["line_id"] == "ocr:stable"
+    assert payload["ocr_reader_runtime"]["last_stable_line"]["stability"] == "stable"
+
+
 def test_status_payload_exposes_ocr_decision_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -974,6 +1071,28 @@ def test_status_payload_primary_diagnosis_ignores_stale_self_ui_guard_after_new_
     )
 
     assert diagnosis["title"] != "OCR 抓到了非游戏画面"
+
+
+def test_status_payload_primary_diagnosis_reports_self_ui_guard_as_warning() -> None:
+    diagnosis = galgame_service.build_primary_diagnosis(
+        {
+            "last_error": {
+                "message": "ocr_reader ignored text that looks like the N.E.K.O plugin UI",
+            },
+        }
+    )
+
+    assert diagnosis["severity"] == "warning"
+    assert diagnosis["title"] == "OCR 截到了插件 UI，已忽略"
+    assert diagnosis["title_i18n_key"] == "ui.diag.self_ui_guard.title"
+    assert diagnosis["message_i18n_key"] == "ui.diag.self_ui_guard.body"
+    assert "插件运行出错" not in diagnosis["title"]
+    assert {action["id"] for action in diagnosis["actions"]} == {
+        "focus_game",
+        "select_ocr_window",
+        "refresh_ocr_windows",
+        "debug_details",
+    }
 
 
 def test_status_payload_primary_diagnosis_reports_observed_pending(

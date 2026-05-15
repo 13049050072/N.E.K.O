@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +46,7 @@ from plugin.plugins.study_companion.state import build_initial_state
 from plugin.plugins.study_companion.store import StudyStore
 from plugin.plugins.study_companion.study_ocr_pipeline import StudyCaptureProfile, StudyOcrPipeline
 from plugin.plugins.study_companion import service as study_service
+from plugin.plugins.study_companion import tesseract_support as study_tesseract_support
 from plugin.plugins.study_companion.screen_classifier import ScreenClassification, classify_screen_from_ocr
 from plugin.plugins.study_companion.service import _available_tesseract_languages
 from plugin.plugins.study_companion.tutor_llm_agent import TutorLLMAgent, _JSONCorrector
@@ -125,6 +127,10 @@ class _Ctx:
         return {"items": []}
 
     async def run_update(self, **kwargs):
+        self.run_updates.append(dict(kwargs))
+        return {"ok": True}
+
+    async def run_update_async(self, **kwargs):
         self.run_updates.append(dict(kwargs))
         return {"ok": True}
 
@@ -1325,6 +1331,126 @@ def test_available_tesseract_languages_logs_timeout_and_falls_back(
 
     assert languages == {"eng"}
     assert any("timed out" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_study_install_tesseract_uses_local_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    calls: list[dict[str, object]] = []
+
+    async def _fake_install_tesseract(**kwargs):
+        calls.append(dict(kwargs))
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback is not None:
+            maybe_awaitable = progress_callback(
+                {
+                    "phase": "completed",
+                    "message": "Tesseract is ready",
+                    "progress": 1.0,
+                    "downloaded_bytes": 0,
+                    "total_bytes": 0,
+                    "resume_from": 0,
+                    "asset_name": "",
+                    "release_name": "",
+                }
+            )
+            if hasattr(maybe_awaitable, "__await__"):
+                await maybe_awaitable
+        return {"summary": "Tesseract is ready", "detected_path": "C:/Tesseract/tesseract.exe"}
+
+    monkeypatch.setattr(study_tesseract_support, "install_tesseract", _fake_install_tesseract)
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "en"},
+            "ocr_reader": {
+                "enabled": True,
+                "install_target_dir": str(tmp_path / "Tesseract-OCR"),
+                "languages": "eng",
+            },
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+
+    try:
+        install_result = await plugin.study_install_tesseract(force=True, _ctx={"run_id": "run-study-install"})
+
+        assert isinstance(install_result, Ok)
+        assert install_result.value["summary"] == "Tesseract is ready"
+        assert calls
+        assert calls[0]["plugin_id"] == "study_companion"
+        assert calls[0]["task_id"] == "run-study-install"
+        assert calls[0]["force"] is True
+        assert ctx.run_updates
+        assert ctx.run_updates[-1]["run_id"] == "run-study-install"
+    finally:
+        await plugin.shutdown()
+
+
+def test_study_ocr_pipeline_uses_local_tesseract_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: list[dict[str, object]] = []
+
+    class _FakeTesseractBackend:
+        def __init__(self, **kwargs) -> None:
+            created.append(dict(kwargs))
+
+    monkeypatch.setattr(study_tesseract_support, "TesseractOcrBackend", _FakeTesseractBackend)
+    pipeline = StudyOcrPipeline(
+        logger=_Logger(),
+        config=StudyConfig(
+            ocr_backend_selection="tesseract",
+            ocr_tesseract_path="C:/Tesseract/tesseract.exe",
+            ocr_install_target_dir="C:/Tesseract",
+            ocr_languages="eng",
+        ),
+    )
+
+    backend = pipeline._resolve_ocr_backend()
+
+    assert isinstance(backend, _FakeTesseractBackend)
+    assert created == [
+        {
+            "tesseract_path": "C:/Tesseract/tesseract.exe",
+            "install_target_dir_raw": "C:/Tesseract",
+            "languages": "eng",
+        }
+    ]
+
+
+def test_study_tesseract_backend_restores_global_tesseract_cmd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "tesseract.exe"
+    executable.write_text("", encoding="utf-8")
+    calls: list[tuple[object, str]] = []
+    fake_pytesseract = SimpleNamespace()
+    fake_pytesseract.pytesseract = SimpleNamespace(tesseract_cmd="original-cmd")
+
+    def image_to_string(candidate: object, *, lang: str, config: str) -> str:
+        calls.append((candidate, fake_pytesseract.pytesseract.tesseract_cmd))
+        return "recognized text"
+
+    fake_pytesseract.image_to_string = image_to_string
+    monkeypatch.setitem(sys.modules, "pytesseract", fake_pytesseract)
+    monkeypatch.setattr(study_tesseract_support, "_prepare_ocr_image", lambda image: "prepared-image")
+
+    backend = study_tesseract_support.TesseractOcrBackend(
+        tesseract_path=str(executable),
+        languages="eng",
+    )
+
+    assert backend.extract_text("source-image") == "recognized text"
+    assert calls == [
+        ("source-image", str(executable)),
+        ("prepared-image", str(executable)),
+    ]
+    assert fake_pytesseract.pytesseract.tesseract_cmd == "original-cmd"
 
 
 @pytest.mark.asyncio

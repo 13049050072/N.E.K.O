@@ -2285,9 +2285,17 @@ class OmniOfflineClient:
                         # except 与本块互斥，不会双计（Codex）。
                         try:
                             from utils.instrument import counter as _ic
-                            _ic("llm_error", error_class=error_type[:48])
+                            # before_first_loop：错误发生在用户体验到核心 loop 之前 =
+                            # 首次体验障碍型流失（开了口但没收到回复）。true/false/unknown
+                            # 低基数；区分"卡在首次体验"vs"用过之后才报错"两类 D1 流失。
+                            try:
+                                from utils.token_tracker import TokenTracker as _TT
+                                _bfl = "false" if _TT.get_instance().has_completed_core_loop() else "true"
+                            except Exception:
+                                _bfl = "unknown"
+                            _ic("llm_error", error_class=error_type[:48], before_first_loop=_bfl)
                             if api_key_rejected:
-                                _ic("api_key_invalid")
+                                _ic("api_key_invalid", before_first_loop=_bfl)
                         except Exception:
                             # 埋点 best-effort，绝不影响错误上报 / 重试主流程。
                             pass
@@ -2348,9 +2356,16 @@ class OmniOfflineClient:
                     # 是源码版用户的常见流失坑。
                     try:
                         from utils.instrument import counter as _instr_counter
-                        _instr_counter("llm_error", error_class=type(e).__name__[:48])
+                        # before_first_loop 与 typed 错误路径（_count_llm_error）保持
+                        # 同维度，避免 llm_error/api_key_invalid 混合标签拆裂 D1 分桶。
+                        try:
+                            from utils.token_tracker import TokenTracker as _TT
+                            _bfl = "false" if _TT.get_instance().has_completed_core_loop() else "true"
+                        except Exception:
+                            _bfl = "unknown"
+                        _instr_counter("llm_error", error_class=type(e).__name__[:48], before_first_loop=_bfl)
                         if is_api_key_rejected:
-                            _instr_counter("api_key_invalid")
+                            _instr_counter("api_key_invalid", before_first_loop=_bfl)
                     except Exception:
                         # 埋点 best-effort，绝不掩盖/打断原始 LLM 错误的处理路径。
                         pass

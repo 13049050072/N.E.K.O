@@ -99,6 +99,34 @@ def normalize_steam_id(raw) -> str:
     return ""
 
 
+# device_hw 服务端白名单：公开 ingest 边界上客户端串不可信（HMAC 密钥开源可读），
+# 伪造请求能把任意 64 字符 preserve-known 进 devices.device_hw，污染"设备画像"基数
+# 或注入 PII。只放行 os|arch|ram_tier|cpu_tier 四段、每段在已知 enum 内的串。
+_DEVICE_HW_ALLOWED = (
+    {"win", "mac", "linux", "other"},
+    {"x86_64", "arm64", "other"},
+    {"lt8", "8to16", "16to32", "ge32", "unknown"},
+    {"le4", "5to8", "9to16", "gt16", "unknown"},
+)
+
+
+def normalize_device_hw(raw) -> str:
+    """校验 device_hw 复合串（与客户端 _get_device_hw 同口径），非法回退 ''。
+
+    server 边界防伪造污染：只放行恰好 4 段、每段命中对应 enum 的串，其余一律 ''
+    （含 None / 非 str / 段数不符 / 任一段越界）。与 steam_user_id 同样在 ingest
+    边界做白名单，守 device_hw 的低基数 + 零 PII 契约。
+    """
+    if not isinstance(raw, str) or not raw:
+        return ""
+    parts = raw.split("|")
+    if len(parts) != len(_DEVICE_HW_ALLOWED):
+        return ""
+    if all(p in allowed for p, allowed in zip(parts, _DEVICE_HW_ALLOWED)):
+        return raw
+    return ""
+
+
 class TelemetryStorage:
     """线程安全的 SQLite 遥测存储。"""
 
@@ -185,6 +213,7 @@ class TelemetryStorage:
                     timezone      TEXT    NOT NULL DEFAULT 'unknown',
                     distribution  TEXT    NOT NULL DEFAULT 'unknown',
                     steam_user_id TEXT    NOT NULL DEFAULT '',
+                    device_hw     TEXT    NOT NULL DEFAULT '',
                     first_seen    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+08:00', 'now', '+8 hours')),
                     last_seen     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+08:00', 'now', '+8 hours')),
                     event_count   INTEGER NOT NULL DEFAULT 0
@@ -306,6 +335,7 @@ class TelemetryStorage:
                 ("timezone", "unknown"),
                 ("distribution", "unknown"),
                 ("steam_user_id", ""),
+                ("device_hw", ""),
             )
             for col_name, default in _new_cols:
                 if col_name in existing_cols:
@@ -335,7 +365,7 @@ class TelemetryStorage:
                     daily_stats: dict, batch_id: str | None = None,
                     branch: str = "unknown", locale: str = "unknown",
                     timezone: str = "unknown", distribution: str = "unknown",
-                    steam_user_id: str = "",
+                    steam_user_id: str = "", device_hw: str = "",
                     instruments: dict | None = None):
         today = date.today().isoformat()
         with self._transaction() as conn:
@@ -396,9 +426,9 @@ class TelemetryStorage:
             # 被下游 join 当成合法 ID）。两种 sentinel 都走 preserve-known：
             # incoming 是 sentinel 时不覆写历史。
             conn.execute("""
-                INSERT INTO devices (device_id, app_version, branch, locale, timezone, distribution, steam_user_id,
+                INSERT INTO devices (device_id, app_version, branch, locale, timezone, distribution, steam_user_id, device_hw,
                                      first_seen, last_seen, event_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?,
                         strftime('%Y-%m-%dT%H:%M:%f+08:00', 'now', '+8 hours'),
                         strftime('%Y-%m-%dT%H:%M:%f+08:00', 'now', '+8 hours'), 1)
                 ON CONFLICT(device_id) DO UPDATE SET
@@ -408,9 +438,20 @@ class TelemetryStorage:
                     timezone      = CASE WHEN excluded.timezone      = 'unknown' THEN devices.timezone      ELSE excluded.timezone      END,
                     distribution  = CASE WHEN excluded.distribution  = 'unknown' THEN devices.distribution  ELSE excluded.distribution  END,
                     steam_user_id = CASE WHEN excluded.steam_user_id = ''        THEN devices.steam_user_id ELSE excluded.steam_user_id END,
+                    -- device_hw 硬件静态：空 sentinel 不覆写；且"退化" profile（含更多
+                    -- unknown 段，多半是某次 psutil/cpu 检测临时失败）不得覆盖已知更完整
+                    -- 的 profile —— 用 'unknown' 出现次数（length diff）粗比，incoming 更
+                    -- 多就保留历史。检测变好（unknown 更少）或首次（历史空）正常覆写。
+                    device_hw     = CASE
+                        WHEN excluded.device_hw = '' THEN devices.device_hw
+                        WHEN devices.device_hw != ''
+                             AND (length(excluded.device_hw) - length(replace(excluded.device_hw, 'unknown', '')))
+                               > (length(devices.device_hw) - length(replace(devices.device_hw, 'unknown', '')))
+                        THEN devices.device_hw
+                        ELSE excluded.device_hw END,
                     last_seen = strftime('%Y-%m-%dT%H:%M:%f+08:00', 'now', '+8 hours'),
                     event_count = event_count + 1
-            """, (device_id, app_version, branch, locale, timezone, distribution, steam_user_id))
+            """, (device_id, app_version, branch, locale, timezone, distribution, steam_user_id, device_hw))
 
             # Instrument 累加（同事务内）：失败回滚整批，daily_stats 不会
             # 在 instruments 失败时半截入库。

@@ -2022,7 +2022,12 @@ class LLMSessionManager:
                 # Telemetry：D1 漏斗——本进程首条用户消息（语音路径）。
                 try:
                     from utils.token_tracker import TokenTracker as _TT
-                    _TT.get_instance().note_first_user_message("voice")
+                    _tt = _TT.get_instance()
+                    _tt.note_first_user_message("voice")
+                    # 每条用户消息：user_message_sent counter（轮数 + voice/text 占比）
+                    # + 累加 per-session 轮数（session_end emit session_turn_count）。
+                    # 只在此真语音消息点调，避开 2041 openclaw 文本 handoff 复用，杜绝双计。
+                    _tt.note_user_message("voice")
                 except Exception:
                     # 埋点 best-effort，绝不阻塞语音转录消息处理（同文本路径）。
                     pass
@@ -3523,6 +3528,16 @@ class LLMSessionManager:
         self.session_start_failure_count += 1
         self.session_start_last_failure_time = datetime.now()
         logger.error(f"[语音会话诊断] start_session 失败 (总耗时: {time.time() - diag_start:.2f}秒): {e}")
+        # Telemetry：语音会话启动失败 —— 语音优先桌宠，voice 在用户开口前就坏掉
+        # = 静默 D1 流失（现在完全看不到）。reason 用异常类名（低基数 enum）。
+        # **仅 audio 模式计**：本收口对 text/audio 两种 start_session 都用，text
+        # 启动失败不该误标成 voice_setup_failed 污染该信号。best-effort 不阻塞收口。
+        if input_mode == 'audio':
+            try:
+                from utils.instrument import counter as _instr_counter
+                _instr_counter("voice_setup_failed", reason=type(e).__name__[:32])
+            except Exception:
+                pass  # 埋点 best-effort：instrument 不可用也不能挡失败收口流程
         error_str = str(e)
 
         is_memory_server_error = isinstance(e, ConnectionError) and any(
@@ -6128,7 +6143,11 @@ class LLMSessionManager:
                     # Telemetry：D1 漏斗——本进程首条用户消息（lazy import 防循环）。
                     try:
                         from utils.token_tracker import TokenTracker as _TT
-                        _TT.get_instance().note_first_user_message("text")
+                        _tt = _TT.get_instance()
+                        _tt.note_first_user_message("text")
+                        # 每条用户消息：user_message_sent counter + 累加 per-session 轮数。
+                        # 此处是文本侧 on_user_message 唯一入口，每条真实消息恰好一次。
+                        _tt.note_user_message("text")
                     except Exception:
                         # 埋点 best-effort，绝不阻塞用户消息处理；note_first_user_message
                         # 自身幂等，丢一次也不影响 D1 漏斗统计。
@@ -6888,7 +6907,14 @@ class LLMSessionManager:
                         # 首日听不到语音是核心体验断裂，D1 流失重要信号。
                         try:
                             from utils.instrument import counter as _instr_counter
-                            _instr_counter("tts_error", code=str(self._last_tts_error_code or "unknown")[:32])
+                            # before_first_loop：TTS 在用户体验到核心 loop 前就坏 =
+                            # 首次体验障碍（开了口但没听到回复）。低基数 true/false/unknown。
+                            try:
+                                from utils.token_tracker import TokenTracker as _TT
+                                _bfl = "false" if _TT.get_instance().has_completed_core_loop() else "true"
+                            except Exception:
+                                _bfl = "unknown"
+                            _instr_counter("tts_error", code=str(self._last_tts_error_code or "unknown")[:32], before_first_loop=_bfl)
                         except Exception:
                             # 埋点 best-effort，绝不影响 TTS 错误的重试/上报主流程。
                             pass

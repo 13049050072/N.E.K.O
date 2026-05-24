@@ -640,6 +640,61 @@ def _get_telemetry_timezone() -> str:
     return "unknown"
 
 
+_DEVICE_HW_CACHE: Optional[str] = None
+
+
+def _get_device_hw() -> str:
+    """设备硬件画像（低基数 enum 复合串），进程内只算一次。
+
+    形如 ``win|x86_64|16to32|9to16``（os|arch|ram_tier|cpu_tier）。作为 devices
+    表的**设备属性**（非计数）上报，用来 JOIN 留存做"低配设备首日流失率"——区分
+    "跑不动而走"与"不喜欢而走"。
+
+    所有维度都是分桶 enum，**绝不发原始值**（RAM 字节 / GPU 型号 / 机器名）——
+    守 dim 低基数 + 零 PII（同 #1426 T3）。
+
+    检测全部 inline（psutil / platform / os）：不 import memory.embeddings —— 那会
+    触发 module-layering 的 utils(L1)→memory(L2) 反转 + 制造 memory↔utils 环
+    （check_module_layering 对函数内 lazy import 同样计）。RAM 检测本就是 psutil
+    一行、没复用价值；真正值得复用的 CPU AVX/VNNI cpuid 检测对"跑不动流失"是
+    二阶信号（多数用户走远程 LLM），暂不收，想要可把检测抽成 utils 层共享 util。
+    任一维度失败回退 'unknown'，整体绝不抛（埋点不能挡上报）。
+    """
+    global _DEVICE_HW_CACHE
+    if _DEVICE_HW_CACHE is not None:
+        return _DEVICE_HW_CACHE
+    import platform as _plat
+
+    sysname = (_plat.system() or "").lower()
+    os_tag = {"windows": "win", "darwin": "mac", "linux": "linux"}.get(sysname, "other")
+
+    mach = (_plat.machine() or "").lower()
+    if mach in ("x86_64", "amd64", "x64"):
+        arch = "x86_64"
+    elif mach in ("arm64", "aarch64"):
+        arch = "arm64"
+    else:
+        arch = "other"
+
+    try:
+        import psutil
+        gb = psutil.virtual_memory().total / (1024 ** 3)
+        ram_tag = ("lt8" if gb < 8 else "8to16" if gb < 16
+                   else "16to32" if gb < 32 else "ge32")
+    except Exception:
+        ram_tag = "unknown"  # psutil 缺失/异常：降级 unknown，埋点不能挡上报
+
+    try:
+        n = os.cpu_count() or 0
+        cpu_tag = ("unknown" if n <= 0 else "le4" if n <= 4 else "5to8" if n <= 8
+                   else "9to16" if n <= 16 else "gt16")
+    except Exception:
+        cpu_tag = "unknown"  # cpu_count 异常：降级 unknown，不抛
+
+    _DEVICE_HW_CACHE = f"{os_tag}|{arch}|{ram_tag}|{cpu_tag}"
+    return _DEVICE_HW_CACHE
+
+
 def _compute_telemetry_signature(payload_json: str, timestamp: float) -> str:
     """计算遥测上报的 HMAC-SHA256 签名。"""
     body_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
@@ -776,6 +831,10 @@ class TokenTracker:
         self._has_recorded_app_start: bool = False  # 🔒 app_start 单次上报锁
         self._session_start_ts: float = 0.0  # session_end 计算 duration 用
         self._session_process: str = "unknown"
+        # 本 session 用户消息轮数。note_user_message 累加，record_app_start 重置，
+        # _atexit_save(session_end) emit 成 session_turn_count histogram —— 含 0
+        # 即"零消息会话"（开了 app 一句没聊就走），D1 流失最直接信号。
+        self._session_msg_count: int = 0
         self._first_user_message_recorded: bool = False  # 🔒 首条用户消息单次锁
         self._core_loop_recorded: bool = False  # 🔒 首次完成核心 loop 单次锁
 
@@ -847,6 +906,10 @@ class TokenTracker:
             if duration > 0:
                 # 直接传秒；instrument bounds 是数字通用，没绑定单位
                 _instr_histogram("session_duration_sec", duration, process=self._session_process)
+            # 本 session 用户消息轮数（无条件 emit，含 0）——0 即零消息会话。
+            # 配合 session_duration_sec 看：短时长+0 轮 = 开了就走；长时长+0 轮 =
+            # 挂着没互动。是 D1 浅尝 vs 上瘾的核心区分。
+            _instr_histogram("session_turn_count", self._session_msg_count, process=self._session_process)
         except Exception:
             # instrument import / emit 失败不能让进程退出卡住 —— 实在丢一条
             # 也比 atexit 抛出强（atexit 异常会让 SIGTERM 退出码变化）。
@@ -1174,6 +1237,7 @@ class TokenTracker:
             self._has_recorded_app_start = True
             self._session_start_ts = time.time()
             self._session_process = process
+            self._session_msg_count = 0  # 新 session 起点，轮数清零
 
         # 新埋点：sparse event 走本地 events.jsonl（诊断），同时打 counter
         # 走远程聚合通道（dashboard 看 DAU / session 总数）。event 因为带
@@ -1230,6 +1294,27 @@ class TokenTracker:
             # 埋点失败不能挡用户消息处理
             pass
 
+    def note_user_message(self, input_type: str = "text"):
+        """每条用户消息都调（区别于 note_first_user_message 只记首条）。
+
+        - emit ``user_message_sent`` counter（input_type 维度）：求和 = 聊天总轮数，
+          按 input_type 切 = voice/text 模态占比
+        - 累加本 session 轮数 ``_session_msg_count``，session_end 时 emit
+          ``session_turn_count`` histogram（含 0 = 零消息会话）
+
+        调用方负责保证每条真实用户消息恰好调一次（见 core.py：只在文本侧
+        on_user_message 入口和真语音消息点调，避开 openclaw handoff 复用路径）。
+        input_type: text / voice（低基数）
+        """
+        with self._lock:
+            self._session_msg_count += 1
+        try:
+            from utils.instrument import counter as _c
+            _c("user_message_sent", input_type=input_type)
+        except Exception:
+            # 埋点失败不能挡用户消息处理
+            pass
+
     def note_core_loop_completed(self):
         """用户完成一轮核心体验：发消息→收回复→听到语音。每进程记一次。
 
@@ -1256,6 +1341,15 @@ class TokenTracker:
             # 埋点 best-effort；前面已置位 _core_loop_recorded，丢一次计数
             # 不影响幂等，也不该影响调用方（音频投递路径）。
             pass
+
+    def has_completed_core_loop(self) -> bool:
+        """本进程内用户是否已完成过一轮核心体验（发消息→收回复→听到语音）。
+
+        给各错误埋点站点判 ``before_first_loop`` 维度用：False = 错误发生在用户
+        还没体验到产品核心之前 = 首次体验障碍型流失（最该救）；True = 体验过
+        核心之后的错误，流失更可能是产品价值问题。两类运营动作不同。
+        """
+        return self._core_loop_recorded
 
     # ---- 持久化 ----
 
@@ -1433,6 +1527,7 @@ class TokenTracker:
             # 杜绝原本两次独立 GetSteamID() 跨 SDK ready 边界产生的
             # release + 非空 Steam64 矛盾态。
             telemetry_distribution, telemetry_steam_user_id = _get_telemetry_metadata()
+            telemetry_device_hw = _get_device_hw()
 
             payload = {
                 "device_id": self._device_id,
@@ -1450,6 +1545,9 @@ class TokenTracker:
                 # 仅在 Steamworks SDK 起来 + 拿到 Steam64 时填值，其它情况为
                 # 空 string。server 端按 preserve-known 处理：空值不覆写历史。
                 "steam_user_id": telemetry_steam_user_id,
+                # 设备硬件画像（低基数 enum 复合串）。设备属性，server preserve-known
+                # UPSERT；用来 JOIN 留存做"低配设备首日流失"分析。
+                "device_hw": telemetry_device_hw,
                 "daily_stats": send_daily,
                 "recent_records": send_records,
             }

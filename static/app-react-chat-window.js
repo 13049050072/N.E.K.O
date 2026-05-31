@@ -29,8 +29,8 @@
     var savedExpandedShellPosition = null; // last known full-surface desktop position
     var lastRestorableChatSurfaceMode = 'compact';
     var _sortKeySeq = 0; // monotonically increasing sortKey counter
+    var COMPACT_CHAT_STATES = ['input'];
     var CHAT_SURFACE_MODE_SEQUENCE = ['compact', 'minimized'];
-    var COMPACT_CHAT_STATES = ['default', 'options', 'input'];
 
     var state = {
         viewProps: null,
@@ -49,8 +49,8 @@
         pendingRollbackDrafts: Object.create(null),
         rollbackDraft: '',
         _toolCursorResetKey: '',
+        compactChatState: 'input',
         chatSurfaceMode: 'compact',
-        compactChatState: 'default',
         // Off until init() reads the persisted preference post-barrier and
         // calls setGalgameModeEnabled(true) — that path fires the
         // galgame-mode-change event, which is the only signal chat.html's
@@ -78,7 +78,7 @@
     }
 
     function normalizeCompactChatState(mode) {
-        return COMPACT_CHAT_STATES.indexOf(mode) >= 0 ? mode : 'default';
+        return COMPACT_CHAT_STATES.indexOf(mode) >= 0 ? mode : 'input';
     }
 
     function getCurrentChatSurfaceMode() {
@@ -121,7 +121,7 @@
     }
 
     function resetCompactChatState() {
-        state.compactChatState = 'default';
+        state.compactChatState = 'input';
     }
 
     function shouldPersistChatSurfaceModePreference() {
@@ -999,20 +999,42 @@
         };
     }
 
-    function expandCompactToolFanNativeRect(rect, element) {
+    var COMPACT_TOOL_FAN_CIRCLE_SLICE_COUNT = 18;
+
+    function readCompactToolFanPixelVar(style, name, fallback) {
+        var rawValue = style ? style.getPropertyValue(name) : '';
+        var parsedValue = parseFloat(rawValue);
+        return Number.isFinite(parsedValue) ? parsedValue : fallback;
+    }
+
+    function buildCompactToolFanCircleSliceRects(rect, element) {
         if (!rect) return null;
         var style = window.getComputedStyle ? window.getComputedStyle(element) : null;
-        var rawButtonSize = style ? parseFloat(style.getPropertyValue('--compact-tool-button-size')) : 0;
-        var buttonSize = Number.isFinite(rawButtonSize) && rawButtonSize > 0 ? rawButtonSize : 38;
-        var previewPad = Math.ceil(buttonSize * 1.7);
-        return {
-            left: rect.left - previewPad,
-            top: rect.top - previewPad,
-            width: rect.width + previewPad,
-            height: rect.height + previewPad,
-            right: rect.right,
-            bottom: rect.bottom
-        };
+        var centerX = rect.left + readCompactToolFanPixelVar(style, '--compact-tool-wheel-center-x', 116);
+        var centerY = rect.top + readCompactToolFanPixelVar(style, '--compact-tool-wheel-center-y', 116);
+        var radius = readCompactToolFanPixelVar(style, '--compact-tool-wheel-hover-radius', 116);
+        if (!Number.isFinite(radius) || radius <= 0) return null;
+        var sliceHeight = (radius * 2) / COMPACT_TOOL_FAN_CIRCLE_SLICE_COUNT;
+        var slices = [];
+        for (var index = 0; index < COMPACT_TOOL_FAN_CIRCLE_SLICE_COUNT; index += 1) {
+            var top = centerY - radius + (sliceHeight * index);
+            var bottom = index === COMPACT_TOOL_FAN_CIRCLE_SLICE_COUNT - 1
+                ? centerY + radius
+                : top + sliceHeight;
+            var middleY = (top + bottom) / 2;
+            var halfWidth = Math.sqrt(Math.max(0, (radius * radius) - ((middleY - centerY) * (middleY - centerY))));
+            var left = centerX - halfWidth;
+            var right = centerX + halfWidth;
+            slices.push({
+                left: left,
+                top: top,
+                width: right - left,
+                height: bottom - top,
+                right: right,
+                bottom: bottom
+            });
+        }
+        return slices;
     }
 
     function collectCompactToolFanGeometryItems(element) {
@@ -1020,15 +1042,17 @@
         var parentRect = getCompactGeometryElementRect(element);
         var items = [];
         if (parentRect) {
-            var nativeRect = expandCompactToolFanNativeRect(parentRect, element) || parentRect;
-            items.push({
-                id: 'toolFan:native',
-                owner: 'surface',
-                kind: 'toolFan',
-                visualRect: nativeRect,
-                hitRect: null,
-                nativeRect: nativeRect,
-                interactive: false
+            var nativeRects = buildCompactToolFanCircleSliceRects(parentRect, element) || [parentRect];
+            nativeRects.forEach(function (nativeRect, index) {
+                items.push({
+                    id: index === 0 ? 'toolFan:native' : 'toolFan:native:' + index,
+                    owner: 'surface',
+                    kind: 'toolFan',
+                    visualRect: nativeRect,
+                    hitRect: nativeRect,
+                    nativeRect: nativeRect,
+                    interactive: true
+                });
             });
         }
         return items.concat(Array.prototype.slice.call(element.querySelectorAll('.compact-input-tool-item, .composer-icon-popover .composer-icon-button'))
@@ -1038,7 +1062,7 @@
                 if (style && Number(style.opacity) <= 0.01) return null;
                 var slot = child.getAttribute('data-compact-tool-wheel-slot') || '';
                 var isAvatarToolChoice = child.classList && child.classList.contains('composer-icon-button');
-                if (!isAvatarToolChoice && (!slot || slot === 'hidden')) return null;
+                if (!isAvatarToolChoice && (!slot || slot.indexOf('hidden') === 0)) return null;
                 var rect = normalizeCompactDomRect(child.getBoundingClientRect());
                 if (!rect) return null;
                 return {

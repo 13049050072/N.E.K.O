@@ -596,9 +596,10 @@ def test_compact_history_controls_collapse_gives_height_back_to_history_scroll()
     assert "--compact-history-handle-line-width: clamp(38px, calc(var(--compact-history-handle-surface-width) * 0.102), 50px);" in history_handle_block
     assert ".compact-history-visibility-handle.is-open {" in history_handle_block
     assert "--compact-history-handle-line-width: 100%;" in history_handle_block
-    assert "top: calc(var(--desktop-compact-surface-top, var(--compact-surface-top, 68vh)) - 2px);" in history_handle_block
+    assert "top: calc(var(--desktop-compact-surface-top, var(--compact-surface-top, 68vh)) + 8px);" in history_handle_block
     assert "bottom: auto;" in history_handle_block
     assert "bottom: calc(100vh - var(--desktop-compact-surface-top" not in history_handle_block
+    assert "transform: translate(-50%, -50%);" in history_handle_block
     assert "z-index: 100002;" in history_handle_block
     assert "pointer-events: auto;" in history_handle_block
     assert "-webkit-app-region: no-drag;" in history_handle_block
@@ -636,6 +637,48 @@ def test_compact_history_layout_contract_avoids_jitter_feedback():
     assert "height: calc(var(--compact-export-history-region-height)" in scroll_block
     assert "max-height: calc(var(--compact-export-history-region-height)" in scroll_block
     assert "max-height: inherit;" in panel_block
+
+
+def test_compact_history_reduced_motion_closing_hides_immediately():
+    styles = REACT_CHAT_STYLES_PATH.read_text(encoding="utf-8")
+
+    reduced_motion_block = styles.rsplit("@media (prefers-reduced-motion: reduce)", 1)[1]
+    closing_block = css_block(
+        reduced_motion_block,
+        '.compact-export-history-anchor[data-compact-export-history-visibility="closing"] {',
+        ".avatar-cursor-overlay-stage",
+    )
+
+    assert "opacity: 0 !important;" in closing_block
+    assert "visibility: hidden !important;" in closing_block
+
+
+def test_compact_history_closing_bubbles_disable_pointer_events():
+    styles = REACT_CHAT_STYLES_PATH.read_text(encoding="utf-8")
+
+    closing_bubble_block = css_block(
+        styles,
+        '.compact-export-history-anchor[data-compact-export-history-visibility="closing"] .compact-export-history-bubble {',
+        ".compact-export-history-message.is-disabled",
+    )
+
+    assert "animation: compact-history-message-exit" in closing_bubble_block
+    assert "pointer-events: none;" in closing_bubble_block
+
+
+def test_compact_history_enter_animation_excludes_drag_sources():
+    styles = REACT_CHAT_STYLES_PATH.read_text(encoding="utf-8")
+    enter_selector = (
+        '.compact-export-history-anchor[data-compact-export-history-visibility="open"] '
+        ".compact-export-history-message:not([data-compact-history-drag-phase]) "
+        ".compact-export-history-bubble"
+    )
+
+    assert enter_selector in styles
+    assert (
+        '.compact-export-history-anchor[data-compact-export-history-visibility="open"] '
+        ".compact-export-history-bubble {"
+    ) not in styles
 
 
 def test_compact_history_hit_contract_keeps_transparent_wrappers_out_of_hit_regions():

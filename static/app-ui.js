@@ -1470,6 +1470,8 @@
     // ================================================================
 
     const MULTI_WINDOW_RETURN_BALL_DRAG_SHRINK_SIZE = 160;
+    const RETURN_BALL_DRAG_RECOVERY_POLL_MS = 250;
+    const RETURN_BALL_DRAG_STALE_RECOVERY_MS = 12000;
     const MULTI_WINDOW_RETURN_BALL_DRAG_SHRINK_FALLBACK_MS = 220;
     const MULTI_WINDOW_RETURN_BALL_DRAG_RESTORE_FALLBACK_MS = 600;
     const MULTI_WINDOW_RETURN_BALL_REVEAL_FALLBACK_MS = 600;
@@ -2263,6 +2265,16 @@
         }
     }
 
+    function clearReturnBallDragRecoveryTimer(state) {
+        if (!state || !state.dragRecoveryTimer) return;
+        clearTimeout(state.dragRecoveryTimer);
+        state.dragRecoveryTimer = null;
+    }
+
+    function getReturnBallDragScreenCoordinate(value, fallback) {
+        return Number.isFinite(value) ? value : fallback;
+    }
+
     function isNativeReturnBallDragDisabled() {
         const runtime = window.__NEKO_DESKTOP_RUNTIME__ || {};
         return !!(
@@ -2275,7 +2287,13 @@
         const state = multiWindowReturnBallDragState;
         if (!state) return;
 
+        const shouldStopNativeDrag = state.isDragging;
+        const stopScreenX = getReturnBallDragScreenCoordinate(state.releaseScreenX, state.startScreenX);
+        const stopScreenY = getReturnBallDragScreenCoordinate(state.releaseScreenY, state.startScreenY);
+
         state.dragSessionToken += 1;
+        state.isDragging = false;
+        clearReturnBallDragRecoveryTimer(state);
         clearMultiWindowReturnBallDeferredWork(state);
         if (state.container) {
             state.container.removeEventListener('mousedown', state.handleMouseDown, true);
@@ -2283,9 +2301,15 @@
         }
         document.removeEventListener('mousemove', state.handleMouseMove);
         document.removeEventListener('mouseup', state.handleMouseUp);
+        document.removeEventListener('pointermove', state.handlePointerMove, true);
+        document.removeEventListener('pointerup', state.handlePointerUp, true);
+        document.removeEventListener('pointercancel', state.handlePointerCancel, true);
         document.removeEventListener('touchmove', state.handleTouchMove);
         document.removeEventListener('touchend', state.handleTouchEnd);
         document.removeEventListener('touchcancel', state.handleTouchEnd);
+        window.removeEventListener('blur', state.handleWindowBlur);
+        window.removeEventListener('pagehide', state.handlePageHide);
+        document.removeEventListener('visibilitychange', state.handleVisibilityChange);
 
         if (state.container) {
             restoreSavedReturnBallStyle(state.container, state);
@@ -2294,6 +2318,18 @@
         }
         delete document.body.dataset.nekoBallDrag;
         multiWindowReturnBallDragState = null;
+
+        if (shouldStopNativeDrag && window.nekoPetDrag && typeof window.nekoPetDrag.stop === 'function') {
+            Promise.resolve()
+                .then(() => window.nekoPetDrag.stop(stopScreenX, stopScreenY))
+                .finally(() => {
+                    if (window.nekoPetDrag && typeof window.nekoPetDrag.reveal === 'function') {
+                        return window.nekoPetDrag.reveal();
+                    }
+                    return null;
+                })
+                .catch(() => {});
+        }
     }
 
     function ensureMultiWindowReturnBallDrag(container) {
@@ -2328,12 +2364,20 @@
             viewportWaitFallbackTimer: null,
             transitionCleanupTimer: null,
             dragSessionToken: 0,
+            dragRecoveryTimer: null,
+            lastPointerEventAt: 0,
             handleMouseDown: null,
             handleMouseMove: null,
             handleMouseUp: null,
+            handlePointerMove: null,
+            handlePointerUp: null,
+            handlePointerCancel: null,
             handleTouchStart: null,
             handleTouchMove: null,
             handleTouchEnd: null,
+            handleWindowBlur: null,
+            handlePageHide: null,
+            handleVisibilityChange: null,
         };
 
         function getTouchScreenPoint(touch) {
@@ -2451,6 +2495,51 @@
                 container: container
             }).catch(() => {});
             dispatchClickEvent();
+        }
+
+        function markDragPointerActivity() {
+            state.lastPointerEventAt = Date.now();
+        }
+
+        function cancelActiveDrag(reason) {
+            if (!state.isDragging) return;
+            const screenX = getReturnBallDragScreenCoordinate(state.releaseScreenX, state.startScreenX);
+            const screenY = getReturnBallDragScreenCoordinate(state.releaseScreenY, state.startScreenY);
+            void finishDrag(screenX, screenY, {
+                reason: reason || 'return-ball-drag-cancel',
+                suppressClick: true
+            });
+        }
+
+        function scheduleReturnBallDragRecoveryCheck() {
+            clearReturnBallDragRecoveryTimer(state);
+            if (!state.isDragging) return;
+            state.dragRecoveryTimer = setTimeout(() => {
+                state.dragRecoveryTimer = null;
+                if (!state.isDragging) return;
+                if (document.hidden) {
+                    cancelActiveDrag('document-hidden');
+                    return;
+                }
+                if (Date.now() - state.lastPointerEventAt > RETURN_BALL_DRAG_STALE_RECOVERY_MS) {
+                    cancelActiveDrag('stale-pointer-timeout');
+                    return;
+                }
+                scheduleReturnBallDragRecoveryCheck();
+            }, RETURN_BALL_DRAG_RECOVERY_POLL_MS);
+        }
+
+        function finishDragIfMouseButtonReleased(event, reason) {
+            if (!state.isDragging || !event || (event.pointerType && event.pointerType !== 'mouse')) {
+                return false;
+            }
+            if (!Number.isFinite(event.buttons) || event.buttons !== 0) {
+                return false;
+            }
+            void finishDrag(event.screenX, event.screenY, {
+                reason: reason || 'buttons-released'
+            });
+            return true;
         }
 
         function isViewportRestored(expectedWidth, expectedHeight) {
@@ -2600,6 +2689,7 @@
             state.releaseScreenY = screenY;
             state.savedWindowW = window.innerWidth;
             state.savedWindowH = window.innerHeight;
+            markDragPointerActivity();
 
             const rect = container.getBoundingClientRect();
             state.savedBallWidth = Math.round(rect.width) || 64;
@@ -2664,6 +2754,7 @@
                     continueOnFallback: true
                 }
             );
+            scheduleReturnBallDragRecoveryCheck();
 
             if (event) {
                 event.preventDefault();
@@ -2673,6 +2764,7 @@
 
         function updateDrag(screenX, screenY) {
             if (!state.isDragging) return;
+            markDragPointerActivity();
             state.releaseScreenX = screenX;
             state.releaseScreenY = screenY;
 
@@ -2705,10 +2797,13 @@
         async function finishDrag(screenX, screenY) {
             if (!state.isDragging) return;
 
+            const options = arguments[2] && typeof arguments[2] === 'object' ? arguments[2] : {};
+            const suppressClick = options.suppressClick === true;
             state.isDragging = false;
             state.releaseScreenX = screenX;
             state.releaseScreenY = screenY;
             const dragToken = state.dragSessionToken;
+            clearReturnBallDragRecoveryTimer(state);
             clearMultiWindowReturnBallDeferredWork(state);
 
             // 先瞬间隐藏球，防止恢复 UI 时球在 (8,8) 闪烁
@@ -2732,9 +2827,23 @@
                     restoreSavedBallStyle();
                     delete document.body.dataset.nekoBallDrag;
                     container.setAttribute('data-dragging', 'false');
-                    scheduleIdleReturnBallDesktopBridge('return-ball-drag-click', container);
+                    scheduleIdleReturnBallDesktopBridge(
+                        suppressClick ? 'return-ball-drag-cancel' : 'return-ball-drag-click',
+                        container
+                    );
                     revealReturnBallDragWindow();
-                    dispatchReturnBallClick();
+                    if (suppressClick) {
+                        window.dispatchEvent(new CustomEvent('neko:return-ball-manual-move', {
+                            detail: {
+                                reason: 'return-ball-drag-end',
+                                container: container,
+                                movedDistancePx: 0,
+                                dragCancelled: true
+                            }
+                        }));
+                    } else {
+                        dispatchReturnBallClick();
+                    }
                 }, {
                     fallbackMs: MULTI_WINDOW_RETURN_BALL_DRAG_RESTORE_FALLBACK_MS,
                     continueOnFallback: true
@@ -2778,7 +2887,8 @@
                         detail: {
                             reason: 'return-ball-drag-end',
                             container: container,
-                            movedDistancePx: movedDistancePx
+                            movedDistancePx: movedDistancePx,
+                            dragCancelled: suppressClick
                         }
                     }));
                     revealReturnBallDragWindow();
@@ -2796,7 +2906,8 @@
                     detail: {
                         reason: 'return-ball-drag-end',
                         container: container,
-                        movedDistancePx: movedDistancePx
+                        movedDistancePx: movedDistancePx,
+                        dragCancelled: suppressClick
                     }
                 }));
                 revealReturnBallDragWindow();
@@ -2822,10 +2933,23 @@
             beginDrag(event.screenX, event.screenY, event);
         };
         state.handleMouseMove = (event) => {
+            if (finishDragIfMouseButtonReleased(event, 'mousemove-buttons-released')) return;
             updateDrag(event.screenX, event.screenY);
         };
         state.handleMouseUp = (event) => {
             void finishDrag(event.screenX, event.screenY);
+        };
+        state.handlePointerMove = (event) => {
+            if (finishDragIfMouseButtonReleased(event, 'pointermove-buttons-released')) return;
+            if (event && event.pointerType === 'mouse') {
+                updateDrag(event.screenX, event.screenY);
+            }
+        };
+        state.handlePointerUp = (event) => {
+            void finishDrag(event.screenX, event.screenY);
+        };
+        state.handlePointerCancel = () => {
+            cancelActiveDrag('pointercancel');
         };
         state.handleTouchStart = (event) => {
             const point = getTouchScreenPoint(event.touches[0]);
@@ -2846,14 +2970,31 @@
                 point ? point.y : state.releaseScreenY
             );
         };
+        state.handleWindowBlur = () => {
+            cancelActiveDrag('window-blur');
+        };
+        state.handlePageHide = () => {
+            cancelActiveDrag('pagehide');
+        };
+        state.handleVisibilityChange = () => {
+            if (document.hidden) {
+                cancelActiveDrag('visibility-hidden');
+            }
+        };
 
         container.addEventListener('mousedown', state.handleMouseDown, true);
         container.addEventListener('touchstart', state.handleTouchStart, true);
         document.addEventListener('mousemove', state.handleMouseMove);
         document.addEventListener('mouseup', state.handleMouseUp);
+        document.addEventListener('pointermove', state.handlePointerMove, true);
+        document.addEventListener('pointerup', state.handlePointerUp, true);
+        document.addEventListener('pointercancel', state.handlePointerCancel, true);
         document.addEventListener('touchmove', state.handleTouchMove, { passive: false });
         document.addEventListener('touchend', state.handleTouchEnd);
         document.addEventListener('touchcancel', state.handleTouchEnd);
+        window.addEventListener('blur', state.handleWindowBlur);
+        window.addEventListener('pagehide', state.handlePageHide);
+        document.addEventListener('visibilitychange', state.handleVisibilityChange);
 
         multiWindowReturnBallDragState = state;
     }

@@ -184,6 +184,18 @@
         }
     }
 
+    function readInitialChatSurfaceMode() {
+        var body = document.body;
+        var declaredModeAttr = body
+            ? body.getAttribute('data-initial-chat-surface-mode')
+            : '';
+        var declaredMode = declaredModeAttr ? normalizeChatSurfaceMode(declaredModeAttr) : '';
+        if (declaredMode === 'compact' || declaredMode === 'full') {
+            return declaredMode;
+        }
+        return readChatSurfaceModePreference();
+    }
+
     function persistChatSurfaceModePreference(mode) {
         // Persist only the restorable surfaces (compact/full); minimized restores
         // to lastRestorableChatSurfaceMode rather than being persisted directly.
@@ -5451,7 +5463,7 @@
         var avatarHeaderButton = $('avatarPreviewHeaderButton');
 
         ensureViewProps();
-        state.chatSurfaceMode = readChatSurfaceModePreference();
+        state.chatSurfaceMode = readInitialChatSurfaceMode();
         lastRestorableChatSurfaceMode = state.chatSurfaceMode;
         resetCompactChatState();
         state.viewProps = Object.assign({}, ensureViewProps(), {
